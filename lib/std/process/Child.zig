@@ -29,6 +29,9 @@ pub const Id = switch (native_os) {
 id: Id,
 thread_handle: if (native_os == .windows) windows.HANDLE else void,
 
+/// Linux only. May be unavailable on older kernel versions.
+pid_fd: ?posix.fd_t,
+
 allocator: mem.Allocator,
 
 /// The writing end of the child process's standard input pipe.
@@ -213,6 +216,7 @@ pub fn init(argv: []const []const u8, allocator: mem.Allocator) ChildProcess {
         .argv = argv,
         .id = undefined,
         .thread_handle = undefined,
+        .pid_fd = null,
         .err_pipe = null,
         .term = null,
         .env_map = null,
@@ -291,10 +295,22 @@ pub fn killPosix(self: *ChildProcess) !Term {
         self.cleanupStreams();
         return term;
     }
-    posix.kill(self.id, posix.SIG.TERM) catch |err| switch (err) {
-        error.ProcessNotFound => return error.AlreadyTerminated,
-        else => return err,
-    };
+    if (self.pid_fd) |pid_fd| {
+        if (native_os == .linux) {
+            switch (linux.E.init(linux.pidfd_send_signal(pid_fd, posix.SIG.TERM, null, 0))) {
+                .SUCCESS => {},
+                .SRCH => return error.AlreadyTerminated,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        } else {
+            unreachable;
+        }
+    } else {
+        posix.kill(self.id, posix.SIG.TERM) catch |err| switch (err) {
+            error.ProcessNotFound => return error.AlreadyTerminated,
+            else => return err,
+        };
+    }
     self.waitUnwrapped();
     return self.term.?;
 }
@@ -305,6 +321,7 @@ pub const WaitError = SpawnError || std.os.windows.GetProcessMemoryInfoError;
 pub fn wait(self: *ChildProcess) WaitError!Term {
     const term = if (native_os == .windows) try self.waitWindows() else self.waitPosix();
     self.id = undefined;
+    self.pid_fd = null;
     return term;
 }
 
@@ -451,6 +468,34 @@ fn waitUnwrappedWindows(self: *ChildProcess) WaitError!void {
 
 fn waitUnwrapped(self: *ChildProcess) void {
     const res: posix.WaitPidResult = res: {
+        if (self.pid_fd) |pid_fd| {
+            if (native_os == .linux) {
+                var info: linux.siginfo_t = undefined;
+                var ru: linux.rusage = undefined;
+                while (true) {
+                    switch (linux.E.init(linux.syscall5(.waitid, @intFromEnum(linux.P.PIDFD), @intCast(pid_fd), @intFromPtr(&info), linux.W.EXITED, @intFromPtr(&ru)))) {
+                        .SUCCESS => break,
+                        .INTR => continue,
+                        else => unreachable,
+                    }
+                }
+                if (self.request_resource_usage_statistics) {
+                    self.resource_usage_statistics.rusage = ru;
+                }
+                const status: u32 = @bitCast(info.fields.common.second.sigchld.status);
+                break :res posix.WaitPidResult{
+                    .pid = info.fields.common.first.piduid.pid,
+                    .status = switch (info.code) {
+                        1 => (status & 0xff) << 8, // CLD_EXITED
+                        2, 3 => status & 0x7f, // CLD_KILLED, CLD_DUMPED
+                        else => unreachable,
+                    },
+                };
+            } else {
+                unreachable;
+            }
+        }
+
         if (self.request_resource_usage_statistics) {
             switch (native_os) {
                 .linux, .macos, .ios => {
@@ -727,13 +772,17 @@ fn spawnPosix(self: *ChildProcess) SpawnError!void {
         defer self.allocator.free(stack);
 
         var clone_args = mem.zeroes(linux.clone_args);
-        clone_args.flags = linux.CLONE.VM | linux.CLONE.VFORK | linux.CLONE.CLEAR_SIGHAND;
+        var pid_fd: posix.fd_t = undefined;
+        clone_args.flags = linux.CLONE.VM | linux.CLONE.VFORK | linux.CLONE.CLEAR_SIGHAND | linux.CLONE.PIDFD;
         clone_args.exit_signal = linux.SIG.CHLD;
         clone_args.stack = @intFromPtr(stack.ptr);
         clone_args.stack_size = stack_size;
+        clone_args.pidfd = @intFromPtr(&pid_fd);
         var rc = linux.clone3(&clone_args, @sizeOf(linux.clone_args), spawnPosixChildHelper, @intFromPtr(&child_arg));
         switch (linux.E.init(rc)) {
-            .SUCCESS => {},
+            .SUCCESS => {
+                self.pid_fd = pid_fd;
+            },
             .AGAIN, .NOMEM => return error.SystemResources,
             .INVAL, .NOSYS => {
                 // Fallback to use clone().
